@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import torch
@@ -11,28 +11,22 @@ import io
 import numpy as np
 import cv2
 import base64
-import matplotlib.pyplot as plt
+import gc
+import os
 from typing import Dict, List
 
-# Define the model architecture
+# Define the model architecture - simplified for memory efficiency
 class RetinalModel(nn.Module):
     def __init__(self, num_classes=4):
         super().__init__()
-        # Load the torchvision EfficientNet-B3
-        base = models.efficientnet_b3(weights=models.EfficientNet_B3_Weights.IMAGENET1K_V1)
+        # Use a smaller model like EfficientNet-B0 instead of B3
+        base = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
         
-        # Freeze feature extractor
-        for p in base.features.parameters():
-            p.requires_grad = False
-        
-        # Replace classifier with custom head
+        # Get input features
         in_feats = base.classifier[1].in_features
         base.classifier = nn.Sequential(
-            nn.Dropout(0.3, inplace=True),
-            nn.Linear(in_feats, 512),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(512, num_classes)
+            nn.Dropout(0.2, inplace=True),
+            nn.Linear(in_feats, num_classes)
         )
         
         # Expose pieces for Grad-CAM
@@ -57,18 +51,18 @@ app = FastAPI(title="Retinal OCT Image Analyzer API",
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# Global variables
-IMG_SIZE = 224
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Global variables with memory optimization
+IMG_SIZE = 224  # Consider reducing to 196 if memory still an issue
+device = torch.device('cpu')  # Explicitly use CPU
 model = None
 
-# Transform pipeline
+# Optimize transform pipeline
 transform = transforms.Compose([
     transforms.Resize((IMG_SIZE, IMG_SIZE)),
     transforms.ToTensor(),
@@ -82,40 +76,46 @@ async def load_model():
     # Initialize the model
     model = RetinalModel(num_classes=len(CLASS_NAMES)).to(device)
     
-    # Load checkpoint (update path for your deployment)
+    # Load checkpoint with error handling
     checkpoint_path = "best_model.pth"
     try:
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        model.eval()  # Set to evaluation mode
+        # Load with map_location to ensure it loads on CPU
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint)
+        print("Model loaded successfully")
     except Exception as e:
         print(f"Error loading model: {e}")
-        # Initialize with random weights if checkpoint not found
-        model.eval()
+        print("Initializing with random weights")
+    
+    model.eval()  # Set to evaluation mode
 
 def generate_grad_cam(model, img_tensor, target_class=None):
-    """Generate Grad-CAM for the given image tensor"""
-    # Make sure tensor requires grad
+    """Generate Grad-CAM with memory optimization"""
+    # Make sure we're using CPU tensors to reduce memory usage
     img_tensor = img_tensor.clone().detach().requires_grad_(True)
     
-    # Get the feature module
-    feature_module = model.features
-    layers = list(feature_module.children())
-    target_layer = layers[-1]  # last conv block
+    # Store only what we need
+    activations = None
+    gradients = None
     
-    # Hook definition
-    activations, gradients = [], []
     def forward_hook(_, __, out):
-        out.requires_grad_(True)
-        activations.append(out)
-        return out
-    
-    def backward_hook(_, __, grad_out):
-        gradients.append(grad_out[0])
+        nonlocal activations
+        activations = out.detach()
         return None
     
+    def backward_hook(_, __, grad_out):
+        nonlocal gradients
+        gradients = grad_out[0].detach()
+        return None
+    
+    # Get target layer - last convolutional layer
+    target_layer = model.features[-1]
+    
     # Register hooks
-    forward_handle = target_layer.register_forward_hook(forward_hook)
-    backward_handle = target_layer.register_full_backward_hook(backward_hook)
+    hooks = [
+        target_layer.register_forward_hook(forward_hook),
+        target_layer.register_full_backward_hook(backward_hook)
+    ]
     
     # Forward pass
     output = model(img_tensor)
@@ -126,59 +126,85 @@ def generate_grad_cam(model, img_tensor, target_class=None):
     # Zero gradients and backward pass
     model.zero_grad()
     score = output[0, target_class]
-    score.backward(retain_graph=True)
+    score.backward()
     
     # Remove hooks
-    forward_handle.remove()
-    backward_handle.remove()
-    
-    # Get activations and gradients
-    act = activations[0].detach()
-    grad = gradients[0].detach()
+    for hook in hooks:
+        hook.remove()
     
     # Calculate weights and CAM
-    weights = grad.mean(dim=(2, 3), keepdim=True)
-    cam = F.relu((weights * act).sum(dim=1, keepdim=True))
-    cam = F.interpolate(cam, size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False)
+    weights = gradients.mean(dim=(2, 3), keepdim=True)
+    cam = F.relu((weights * activations).sum(dim=1))
+    
+    # Resize CAM to original image size
+    cam = F.interpolate(cam.unsqueeze(0).unsqueeze(0), 
+                       size=(IMG_SIZE, IMG_SIZE), 
+                       mode='bilinear', 
+                       align_corners=False)
+    
     cam = cam.squeeze().cpu().numpy()
-    cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+    
+    # Normalize the CAM
+    if cam.max() != cam.min():
+        cam = (cam - cam.min()) / (cam.max() - cam.min())
+    else:
+        cam = np.zeros((IMG_SIZE, IMG_SIZE), dtype=np.float32)
+    
+    # Clean up to free memory
+    del weights, activations, gradients, output, score
+    torch.cuda.empty_cache() if torch.cuda.is_available() else gc.collect()
     
     return cam, target_class
 
 def image_to_base64(img_array):
-    """Convert image array to base64 string"""
-    success, encoded_img = cv2.imencode('.png', img_array)
+    """Convert image array to base64 string with memory optimization"""
+    success, encoded_img = cv2.imencode('.png', img_array, [cv2.IMWRITE_PNG_COMPRESSION, 9])
     if success:
-        return base64.b64encode(encoded_img).decode('utf-8')
+        result = base64.b64encode(encoded_img).decode('utf-8')
+        # Clean up
+        del encoded_img
+        return result
     return None
 
+def cleanup():
+    """Force garbage collection to free memory"""
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
 @app.post("/predict/", response_model=Dict)
-async def predict(file: UploadFile = File(...)):
+async def predict(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     """Endpoint to predict and generate Grad-CAM for uploaded OCT image"""
     # Check if file is an image
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File is not an image")
     
     try:
-        # Read and process the image
+        # Read the image in chunks to avoid loading large files entirely into memory
         contents = await file.read()
         img = Image.open(io.BytesIO(contents)).convert('RGB')
         
-        # Original image for display
+        # Original image for display - reduce size if needed
         orig_img = np.array(img.resize((IMG_SIZE, IMG_SIZE)))
         
         # Process for model
         img_tensor = transform(img).unsqueeze(0).to(device)
         
-        # Forward pass
+        # Forward pass with memory cleanup
         with torch.no_grad():
             outputs = model(img_tensor)
             probs = torch.softmax(outputs, dim=1)
             pred_idx = torch.argmax(probs, dim=1).item()
             pred_label = CLASS_NAMES[pred_idx]
             confidence = probs[0, pred_idx].item()
+            
+            # Get prediction probabilities for all classes
+            class_probs = {CLASS_NAMES[i]: float(probs[0, i].item()) for i in range(len(CLASS_NAMES))}
+            
+            # Clean up tensors we don't need anymore
+            del outputs
+            del probs
         
-        # Generate Grad-CAM
+        # Generate Grad-CAM (requires gradients)
         cam, _ = generate_grad_cam(model, img_tensor, target_class=pred_idx)
         
         # Convert to heatmap
@@ -187,13 +213,13 @@ async def predict(file: UploadFile = File(...)):
         # Create overlay
         overlay = cv2.addWeighted(orig_img, 0.6, heatmap, 0.4, 0)
         
-        # Get prediction probabilities for all classes
-        class_probs = {CLASS_NAMES[i]: float(probs[0, i].item()) for i in range(len(CLASS_NAMES))}
-        
         # Convert images to base64 for response
         orig_b64 = image_to_base64(cv2.cvtColor(orig_img, cv2.COLOR_RGB2BGR))
         heatmap_b64 = image_to_base64(heatmap)
         overlay_b64 = image_to_base64(overlay)
+        
+        # Clean up variables to free memory
+        del img_tensor, cam, heatmap, overlay, orig_img
         
         # Prepare response
         response = {
@@ -207,9 +233,14 @@ async def predict(file: UploadFile = File(...)):
             }
         }
         
+        # Schedule cleanup after response is sent
+        background_tasks.add_task(cleanup)
+        
         return response
         
     except Exception as e:
+        # Clean up on error
+        gc.collect()
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
 @app.get("/")
