@@ -1,0 +1,31 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+octenv/
+.env/
+venv/
+ENV/
+env/
+*.env
+
+# PyTorch model files
+*.pth
+*.pt
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# VSCode settings (optional, if using VSCode)
+.vscode/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs and other local files
+*.log
