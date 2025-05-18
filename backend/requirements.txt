@@ -6,5 +6,6 @@ opencv-python==4.8.1.78
 matplotlib==3.8.0
 numpy==1.26.0
 gunicorn==23.0.0
-torchvision==0.20.1
-torch==2.5.1
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch==2.3.0+cpu
+torchvision==0.18.1+cpu
