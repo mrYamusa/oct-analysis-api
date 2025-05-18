@@ -167,8 +167,9 @@
         const heatmapImage = document.getElementById("heatmap-image");
         const overlayImage = document.getElementById("overlay-image");
 
-        // API endpoint
-        const apiUrl = "http://localhost:8000/predict/";
+        // API endpoint - UPDATED FOR PRODUCTION
+        // This will be updated to your actual Render.com backend URL
+        const apiUrl = "https://your-backend-app-name.onrender.com/predict/";
 
         submitBtn.addEventListener("click", async function () {
           // Check if file is selected
