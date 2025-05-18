@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import torch
@@ -11,8 +11,9 @@ import io
 import numpy as np
 import cv2
 import base64
-import matplotlib.pyplot as plt
-from typing import Dict, List
+import os
+import time
+from typing import Dict, List, Optional
 
 # Define the model architecture
 class RetinalModel(nn.Module):
@@ -66,7 +67,8 @@ app.add_middleware(
 # Global variables
 IMG_SIZE = 224
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = None
+model: Optional[RetinalModel] = None
+model_ready = False
 
 # Transform pipeline
 transform = transforms.Compose([
@@ -76,21 +78,52 @@ transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-@app.on_event("startup")
-async def load_model():
-    global model
-    # Initialize the model
-    model = RetinalModel(num_classes=len(CLASS_NAMES)).to(device)
+def load_model_task():
+    """Background task to load the model"""
+    global model, model_ready
+    print("Starting model loading...")
+    start_time = time.time()
     
-    # Load checkpoint (update path for your deployment)
-    checkpoint_path = "best_model.pth"
     try:
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        model.eval()  # Set to evaluation mode
-    except Exception as e:
-        print(f"Error loading model: {e}")
-        # Initialize with random weights if checkpoint not found
+        # Initialize the model
+        model = RetinalModel(num_classes=len(CLASS_NAMES)).to(device)
+        
+        # Look for model in different possible locations
+        checkpoint_paths = [
+            "best_model.pth",  # In the current directory
+            os.path.join(os.getcwd(), "best_model.pth"),  # Absolute path
+            "/etc/secrets/best_model.pth"  # Render secret files location
+        ]
+        
+        model_loaded = False
+        for path in checkpoint_paths:
+            if os.path.exists(path):
+                print(f"Found model at {path}")
+                # Setting weights_only=True for security and better loading performance
+                model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+                model_loaded = True
+                break
+        
+        if not model_loaded:
+            print("WARNING: No model file found. Using random weights.")
+        
+        # Set model to evaluation mode
         model.eval()
+        model_ready = True
+        print(f"Model loaded successfully in {time.time() - start_time:.2f} seconds")
+    except Exception as e:
+        print(f"Error loading model: {str(e)}")
+        # Initialize with random weights if loading fails
+        model = RetinalModel(num_classes=len(CLASS_NAMES)).to(device)
+        model.eval()
+        model_ready = True
+        print("Initialized model with random weights after error")
+
+@app.on_event("startup")
+async def startup_event(background_tasks: BackgroundTasks):
+    """Start model loading in background"""
+    background_tasks.add_task(load_model_task)
+    print("Application startup - model loading initiated in background")
 
 def generate_grad_cam(model, img_tensor, target_class=None):
     """Generate Grad-CAM for the given image tensor"""
@@ -152,9 +185,30 @@ def image_to_base64(img_array):
         return base64.b64encode(encoded_img).decode('utf-8')
     return None
 
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    global model_ready
+    return {
+        "message": "OCT Image Analysis API. POST an image to /predict/ to get predictions.",
+        "model_status": "ready" if model_ready else "loading"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    global model_ready
+    return {"status": "healthy", "model_loaded": model_ready}
+
 @app.post("/predict/", response_model=Dict)
 async def predict(file: UploadFile = File(...)):
     """Endpoint to predict and generate Grad-CAM for uploaded OCT image"""
+    global model, model_ready
+    
+    # Check if model is ready
+    if not model_ready:
+        raise HTTPException(status_code=503, detail="Model is still loading, please try again in a moment")
+    
     # Check if file is an image
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File is not an image")
@@ -211,11 +265,6 @@ async def predict(file: UploadFile = File(...)):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {"message": "OCT Image Analysis API. POST an image to /predict/ to get predictions."}
 
 if __name__ == "__main__":
     import uvicorn
